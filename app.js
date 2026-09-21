@@ -1,6 +1,7 @@
 const map = L.map('map', { zoomControl: false }).setView([52.0907, 5.1214], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
-let currentLocation; let locationAccuracy; let userPosition; let selectedDestination; let routeDestination; let routeData; let routeReady = false; let navigationActive = false; let locationWatchId; let appState = 'IDLE';
+let currentLocation; let locationAccuracy; let userPosition; let previousPosition; let selectedDestination; let routeDestination; let routeData; let routeReady = false; let navigationActive = false; let locationWatchId; let appState = 'IDLE'; let navigationHeading; let googleMapsPromise; let streetViewPanorama;
+const googleMapsApiKey = window.APPVERKEER_GOOGLE_MAPS_API_KEY || '';
 const routePanel = document.getElementById('route-panel'); const toast = document.getElementById('toast'); const searchInput = document.getElementById('search-input'); const clearSearch = document.getElementById('clear-search'); let routeLine;
 function showToast(message) { toast.textContent = message; toast.classList.add('is-visible'); window.setTimeout(() => toast.classList.remove('is-visible'), 2600); }
 function setAppState(nextState) {
@@ -63,6 +64,88 @@ async function searchPhotonPlaces(query) {
 
 function formatDistance(meters) { return meters >= 1000 ? `${(meters / 1000).toFixed(1).replace('.', ',')} km` : `${Math.round(meters)} m`; }
 function formatDuration(seconds) { return Math.max(1, Math.round(seconds / 60)); }
+function distanceBetween(first, second) {
+	const earthRadius = 6371000;
+	const latDelta = (second[0] - first[0]) * Math.PI / 180;
+	const lonDelta = (second[1] - first[1]) * Math.PI / 180;
+	const a = Math.sin(latDelta / 2) ** 2 + Math.cos(first[0] * Math.PI / 180) * Math.cos(second[0] * Math.PI / 180) * Math.sin(lonDelta / 2) ** 2;
+	return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function bearingBetween(first, second) {
+	const firstLat = first[0] * Math.PI / 180; const secondLat = second[0] * Math.PI / 180; const lonDelta = (second[1] - first[1]) * Math.PI / 180;
+	return (Math.atan2(Math.sin(lonDelta) * Math.cos(secondLat), Math.cos(firstLat) * Math.sin(secondLat) - Math.sin(firstLat) * Math.cos(secondLat) * Math.cos(lonDelta)) * 180 / Math.PI + 360) % 360;
+}
+function navigationZoom(speed = 0) { return speed > 27 ? 15.8 : speed > 14 ? 16.3 : speed > 5 ? 16.8 : 17.3; }
+function updateNavigationStats(position, gpsSpeed = 0) {
+	if (!routeData || !routeDestination) return;
+	const remaining = distanceBetween(position, [routeDestination.lat, routeDestination.lon]);
+	const speed = Number.isFinite(gpsSpeed) && gpsSpeed > 2 ? gpsSpeed : routeData.distance / routeData.duration;
+	const remainingSeconds = remaining / Math.max(speed, 1);
+	document.getElementById('hud-distance').textContent = formatDistance(remaining);
+	document.getElementById('hud-duration').textContent = formatDuration(remainingSeconds);
+	const arrival = new Date(Date.now() + remainingSeconds * 1000);
+	document.getElementById('hud-eta').textContent = arrival.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+}
+function setNavigationMarker(position, heading, navigating) {
+	if (currentLocation) map.removeLayer(currentLocation);
+	if (navigating) {
+		const navigationIcon = L.divIcon({ className: 'navigation-cursor', html: '<span></span>', iconSize: [30, 30], iconAnchor: [15, 15] });
+		currentLocation = L.marker(position, { icon: navigationIcon, interactive: false }).addTo(map);
+		const element = currentLocation.getElement();
+		if (element && Number.isFinite(heading)) element.style.setProperty('--cursor-heading', `${heading}deg`);
+	} else currentLocation = L.circleMarker(position, { radius: 8, color: '#fff', weight: 4, fillColor: '#2487e8', fillOpacity: 1 }).addTo(map);
+}
+function updateNavigationCamera(position, heading, speed, initial = false) {
+	const mapElement = map.getContainer();
+	mapElement.classList.add('navigation-camera');
+	if (Number.isFinite(heading)) { navigationHeading = heading; mapElement.style.setProperty('--nav-bearing', `${-heading}deg`); }
+	mapElement.style.setProperty('--nav-zoom', navigationZoom(speed));
+	const targetZoom = navigationZoom(speed);
+	if (initial) { map.flyTo(position, targetZoom, { duration: 1.2, easeLinearity: .2 }); window.setTimeout(() => map.panBy([0, -70], { animate: true, duration: .4 }), 1100); }
+	else { map.panTo(position, { animate: true, duration: .35 }); if (Math.abs(map.getZoom() - targetZoom) > .25) map.setZoom(targetZoom, { animate: true, duration: .5 }); }
+}
+function resetNavigationCamera() { const mapElement = map.getContainer(); mapElement.classList.remove('navigation-camera'); mapElement.style.removeProperty('--nav-bearing'); mapElement.style.removeProperty('--nav-zoom'); map.invalidateSize(); }
+function setStreetViewMessage(title, detail) {
+	const message = document.getElementById('streetview-message');
+	message.replaceChildren();
+	const heading = document.createElement('strong'); heading.textContent = title;
+	const copy = document.createElement('span'); copy.textContent = detail;
+	message.append(heading, copy); message.hidden = false;
+}
+function loadGoogleMapsApi() {
+	if (window.google?.maps) return Promise.resolve(window.google.maps);
+	if (!googleMapsApiKey) return Promise.reject(new Error('Street View is nog niet geconfigureerd.'));
+	if (googleMapsPromise) return googleMapsPromise;
+	googleMapsPromise = new Promise((resolve, reject) => {
+		const script = document.createElement('script');
+		script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(googleMapsApiKey)}&v=weekly`;
+		script.async = true; script.defer = true;
+		script.onload = () => window.google?.maps ? resolve(window.google.maps) : reject(new Error('Street View kon niet worden geladen.'));
+		script.onerror = () => reject(new Error('Street View kon niet worden geladen.'));
+		document.head.appendChild(script);
+	});
+	return googleMapsPromise;
+}
+async function openStreetView() {
+	document.body.dataset.view = 'STREETVIEW';
+	document.getElementById('map-mode-button').classList.remove('is-active');
+	document.getElementById('streetview-button').classList.add('is-active');
+	document.getElementById('streetview-panel').hidden = false;
+	setStreetViewMessage('Straatbeeld laden...', 'Beschikbaarheid wordt gecontroleerd.');
+	try {
+		const maps = await loadGoogleMapsApi();
+		const service = new maps.StreetViewService();
+		const location = { lat: userPosition[0], lng: userPosition[1] };
+		service.getPanorama({ location, radius: 60, source: maps.StreetViewSource?.OUTDOOR }, (data, status) => {
+			if (status !== maps.StreetViewStatus.OK || !data?.location?.pano) { setStreetViewMessage('Geen straatbeeld beschikbaar', 'Op dit gedeelte van de route is geen officieel Street View-panorama gevonden.'); return; }
+			const container = document.getElementById('streetview-container');
+			document.getElementById('streetview-message').hidden = true;
+			const options = { pano: data.location.pano, pov: { heading: navigationHeading || 0, pitch: 0, zoom: 1 }, visible: true, addressControl: false, fullscreenControl: false, motionTracking: false };
+			if (!streetViewPanorama) streetViewPanorama = new maps.StreetViewPanorama(container, options); else { streetViewPanorama.setPano(data.location.pano); streetViewPanorama.setPov(options.pov); }
+		});
+	} catch (error) { setStreetViewMessage(error.message, 'Voeg een restricted Google Maps JavaScript API-key toe om 360° straatbeelden te activeren.'); }
+}
+function closeStreetView() { document.getElementById('streetview-panel').hidden = true; document.getElementById('map-mode-button').classList.add('is-active'); document.getElementById('streetview-button').classList.remove('is-active'); document.body.dataset.view = 'MAP'; }
 function instructionText(step) {
 	const type = step.maneuver?.type;
 	const modifier = step.maneuver?.modifier;
@@ -104,6 +187,7 @@ async function drawRoute(destination) {
 
 function startNavigation() {
 	navigationActive = true;
+	previousPosition = userPosition;
 	setAppState('NAVIGATING');
 	routePanel.classList.remove('is-open');
 	document.getElementById('route-preview').hidden = true;
@@ -113,24 +197,35 @@ function startNavigation() {
 	document.getElementById('hud-duration').textContent = formatDuration(routeData?.duration || 0);
 	const arrival = new Date(Date.now() + (routeData?.duration || 0) * 1000);
 	document.getElementById('hud-eta').textContent = arrival.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+	const initialHeading = Number.isFinite(navigationHeading) ? navigationHeading : bearingBetween(userPosition, [routeDestination.lat, routeDestination.lon]);
+	setNavigationMarker(userPosition, initialHeading, true);
+	updateNavigationCamera(userPosition, initialHeading, 0, true);
+	updateNavigationStats(userPosition, 0);
 	showToast(`Navigatie gestart naar ${routeDestination.name.split(',')[0]}`);
 	if (locationWatchId || !navigator.geolocation) return;
 	locationWatchId = navigator.geolocation.watchPosition(position => {
-		const { latitude, longitude, accuracy } = position.coords;
-		userPosition = [latitude, longitude];
-		if (currentLocation) map.removeLayer(currentLocation);
+		const { latitude, longitude, accuracy, heading, speed } = position.coords;
+		const nextPosition = [latitude, longitude];
+		const calculatedHeading = Number.isFinite(heading) && heading >= 0 ? heading : previousPosition && distanceBetween(previousPosition, nextPosition) > 3 ? bearingBetween(previousPosition, nextPosition) : navigationHeading;
+		userPosition = nextPosition;
+		previousPosition = nextPosition;
 		if (locationAccuracy) map.removeLayer(locationAccuracy);
-		locationAccuracy = L.circle(userPosition, { radius: accuracy, color: '#2487e8', weight: 1, fillColor: '#2487e8', fillOpacity: .12 }).addTo(map);
-		currentLocation = L.circleMarker(userPosition, { radius: 8, color: '#fff', weight: 4, fillColor: '#2487e8', fillOpacity: 1 }).addTo(map);
-		map.panTo(userPosition, { animate: true, duration: .5 });
+		locationAccuracy = accuracy > 25 ? L.circle(userPosition, { radius: accuracy, color: '#2487e8', weight: 1, fillColor: '#2487e8', fillOpacity: .12 }).addTo(map) : null;
+		setNavigationMarker(userPosition, calculatedHeading, true);
+		updateNavigationCamera(userPosition, calculatedHeading, speed || 0);
+		updateNavigationStats(userPosition, speed || 0);
 	}, () => showToast('Live locatie tijdelijk niet beschikbaar.'), { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 });
 }
 
 function stopNavigation() {
 	navigationActive = false;
 	setAppState(routeReady ? 'ROUTE_READY' : 'IDLE');
+	closeStreetView();
 	document.getElementById('navigation-hud').hidden = true;
 	if (locationWatchId) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+	resetNavigationCamera();
+	setNavigationMarker(userPosition, null, false);
+	document.body.dataset.view = 'MAP';
 	showToast('Navigatie gestopt');
 }
 
@@ -140,7 +235,7 @@ function updateLocation(position, shouldFlyTo = false) {
 	if (currentLocation) map.removeLayer(currentLocation);
 	if (locationAccuracy) map.removeLayer(locationAccuracy);
 	locationAccuracy = L.circle(userPosition, { radius: accuracy, color: '#2487e8', weight: 1, fillColor: '#2487e8', fillOpacity: .12 }).addTo(map);
-	currentLocation = L.circleMarker(userPosition, { radius: 8, color: '#fff', weight: 4, fillColor: '#2487e8', fillOpacity: 1 }).addTo(map);
+	setNavigationMarker(userPosition, null, false);
 	if (shouldFlyTo) map.flyTo(userPosition, 15, { duration: .7 });
 }
 
@@ -218,6 +313,9 @@ document.getElementById('preview-start-navigation').addEventListener('click', st
 document.getElementById('preview-previous').addEventListener('click', () => showToast('Dit is het eerste routepunt.'));
 document.getElementById('preview-next').addEventListener('click', () => showToast('Volgende routepunt wordt geladen zodra routebeelden beschikbaar zijn.'));
 document.getElementById('stop-navigation').addEventListener('click', stopNavigation);
+document.getElementById('streetview-button').addEventListener('click', openStreetView);
+document.getElementById('map-mode-button').addEventListener('click', closeStreetView);
+document.getElementById('close-streetview').addEventListener('click', closeStreetView);
 document.getElementById('start-route').addEventListener('click', async () => {
 	if (routeReady && routeDestination && !navigationActive) { startNavigation(); return; }
 	const query = document.getElementById('destination-input').value.trim();
