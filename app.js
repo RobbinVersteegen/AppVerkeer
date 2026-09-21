@@ -1,7 +1,6 @@
 const map = L.map('map', { zoomControl: false }).setView([52.0907, 5.1214], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
-let currentLocation; let locationAccuracy; let userPosition; let previousPosition; let selectedDestination; let routeDestination; let routeData; let routeReady = false; let navigationActive = false; let locationWatchId; let appState = 'IDLE'; let navigationHeading; let googleMapsPromise; let streetViewPanorama;
-const googleMapsApiKey = window.APPVERKEER_GOOGLE_MAPS_API_KEY || '';
+let currentLocation; let locationAccuracy; let userPosition; let previousPosition; let selectedDestination; let routeDestination; let routeData; let routeReady = false; let navigationActive = false; let locationWatchId; let appState = 'IDLE'; let navigationHeading;
 const routePanel = document.getElementById('route-panel'); const toast = document.getElementById('toast'); const searchInput = document.getElementById('search-input'); const clearSearch = document.getElementById('clear-search'); let routeLine;
 function showToast(message) { toast.textContent = message; toast.classList.add('is-visible'); window.setTimeout(() => toast.classList.remove('is-visible'), 2600); }
 function setAppState(nextState) {
@@ -112,38 +111,35 @@ function setStreetViewMessage(title, detail) {
 	const copy = document.createElement('span'); copy.textContent = detail;
 	message.append(heading, copy); message.hidden = false;
 }
-function loadGoogleMapsApi() {
-	if (window.google?.maps) return Promise.resolve(window.google.maps);
-	if (!googleMapsApiKey) return Promise.reject(new Error('Street View is nog niet geconfigureerd.'));
-	if (googleMapsPromise) return googleMapsPromise;
-	googleMapsPromise = new Promise((resolve, reject) => {
-		const script = document.createElement('script');
-		script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(googleMapsApiKey)}&v=weekly`;
-		script.async = true; script.defer = true;
-		script.onload = () => window.google?.maps ? resolve(window.google.maps) : reject(new Error('Street View kon niet worden geladen.'));
-		script.onerror = () => reject(new Error('Street View kon niet worden geladen.'));
-		document.head.appendChild(script);
-	});
-	return googleMapsPromise;
+function findKartaViewImage(value) {
+	if (Array.isArray(value)) { for (const item of value) { const result = findKartaViewImage(item); if (result) return result; } }
+	if (!value || typeof value !== 'object') return null;
+	for (const key of ['lth_name', 'name', 'image', 'image_url', 'url']) {
+		if (typeof value[key] === 'string' && /^https?:\/\//.test(value[key])) return value[key];
+	}
+	for (const child of Object.values(value)) { const result = findKartaViewImage(child); if (result) return result; }
+	return null;
 }
 async function openStreetView() {
 	document.body.dataset.view = 'STREETVIEW';
 	document.getElementById('map-mode-button').classList.remove('is-active');
 	document.getElementById('streetview-button').classList.add('is-active');
 	document.getElementById('streetview-panel').hidden = false;
-	setStreetViewMessage('Straatbeeld laden...', 'Beschikbaarheid wordt gecontroleerd.');
+	document.getElementById('route-image').hidden = true;
+	document.getElementById('route-image').removeAttribute('src');
+	setStreetViewMessage('Gratis routebeeld laden...', 'KartaView-dekking wordt gecontroleerd.');
 	try {
-		const maps = await loadGoogleMapsApi();
-		const service = new maps.StreetViewService();
-		const location = { lat: userPosition[0], lng: userPosition[1] };
-		service.getPanorama({ location, radius: 60, source: maps.StreetViewSource?.OUTDOOR }, (data, status) => {
-			if (status !== maps.StreetViewStatus.OK || !data?.location?.pano) { setStreetViewMessage('Geen straatbeeld beschikbaar', 'Op dit gedeelte van de route is geen officieel Street View-panorama gevonden.'); return; }
-			const container = document.getElementById('streetview-container');
-			document.getElementById('streetview-message').hidden = true;
-			const options = { pano: data.location.pano, pov: { heading: navigationHeading || 0, pitch: 0, zoom: 1 }, visible: true, addressControl: false, fullscreenControl: false, motionTracking: false };
-			if (!streetViewPanorama) streetViewPanorama = new maps.StreetViewPanorama(container, options); else { streetViewPanorama.setPano(data.location.pano); streetViewPanorama.setPov(options.pov); }
-		});
-	} catch (error) { setStreetViewMessage(error.message, 'Voeg een restricted Google Maps JavaScript API-key toe om 360° straatbeelden te activeren.'); }
+		const params = new URLSearchParams({ lat: userPosition[0], lng: userPosition[1], distance: '1000' });
+		const response = await fetch(`https://api.openstreetcam.org/2.0/photo/?${params}`);
+		if (!response.ok) throw new Error('Gratis routebeelden zijn tijdelijk niet bereikbaar.');
+		const data = await response.json();
+		const imageUrl = findKartaViewImage(data);
+		if (!imageUrl) { setStreetViewMessage('Geen gratis routebeeld beschikbaar', 'KartaView heeft op dit gedeelte van de route momenteel geen beeld.'); return; }
+		const image = document.getElementById('route-image');
+		image.src = imageUrl;
+		image.hidden = false;
+		document.getElementById('streetview-message').hidden = true;
+	} catch (error) { setStreetViewMessage('Gratis routebeeld niet beschikbaar', error.message); }
 }
 function closeStreetView() { document.getElementById('streetview-panel').hidden = true; document.getElementById('map-mode-button').classList.add('is-active'); document.getElementById('streetview-button').classList.remove('is-active'); document.body.dataset.view = 'MAP'; }
 function instructionText(step) {
